@@ -77,5 +77,4 @@ Record the actual accuracy and macro F1 results displayed by the application. Do
 This is an educational portfolio project. It does not guarantee job suitability, interviews, or employment.
 
 ## Live Demo
-
-Add your Streamlit Community Cloud URL here after deployment.
+https://ai-job-market-intelligence-hkxkzcnofdcuzkxiyptsp9.streamlit.app
