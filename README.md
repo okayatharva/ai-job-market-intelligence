@@ -78,3 +78,27 @@ This is an educational portfolio project. It does not guarantee job suitability,
 
 ## Live Demo
 https://ai-job-market-intelligence-hkxkzcnofdcuzkxiyptsp9.streamlit.app
+
+
+## Project structure
+
+- `app.py`: Streamlit interface and dashboard tabs.
+- `src/config.py`: shared dataset and model settings.
+- `src/text_utils.py`: text cleaning and skill parsing.
+- `src/data_loader.py`: dataset loading and preparation.
+- `src/ml_model.py`: TF-IDF and Logistic Regression.
+- `src/semantic_search.py`: sentence embeddings and similarity search.
+- `src/ai_assistant.py`: Gemini and Ollama integration.
+- `tests/`: automated helper-function tests.
+
+## Run locally
+
+```bash
+python -m streamlit run app.py
+```
+
+## Run tests
+
+```bash
+python -m pytest -q
+```

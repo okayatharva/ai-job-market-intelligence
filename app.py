@@ -21,10 +21,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 # CONFIGURATION
 # ---------------------------------------------------------
 
-DATASET = "batuhanmtl/job-skill-set"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-2.5-flash"
-OLLAMA_MODEL = "llama3.2:1b"
+
+
+# The reusable business logic lives in src/ modules.
+from src.config import DATASET, EMBEDDING_MODEL, GEMINI_MODEL, OLLAMA_MODEL
+from src.text_utils import clean, skills_list, find_column
+from src.data_loader import load_jobs
+from src.ml_model import train_model
+from src.semantic_search import (
+    get_embedding_model,
+    create_embeddings,
+    semantic_search,
+)
+from src.ai_assistant import get_gemini_api_key, ai_answer
 
 st.set_page_config(
     page_title="AI Job Market Intelligence",
@@ -43,375 +52,40 @@ st.caption(
 # TEXT HELPERS
 # ---------------------------------------------------------
 
-def clean(value):
-    """Convert text, lists, and missing values into clean strings."""
-    if value is None:
-        return ""
-
-    if isinstance(value, (list, tuple, set)):
-        return ", ".join(str(item) for item in value if item is not None)
-
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-
-    return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def skills_list(value):
-    """Convert a skill field into a list of readable skills."""
-    if isinstance(value, (list, tuple, set)):
-        raw_skills = list(value)
-    else:
-        text = clean(value)
-
-        if not text:
-            return []
-
-        try:
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, (list, tuple, set)):
-                raw_skills = list(parsed)
-            else:
-                raw_skills = re.split(r"[,;\n|]", text)
-        except (ValueError, SyntaxError):
-            raw_skills = re.split(r"[,;\n|]", text)
-
-    result = []
-    seen = set()
-
-    for skill in raw_skills:
-        item = clean(skill).strip(" []{}'\"")
-        if item and item.lower() not in seen:
-            result.append(item)
-            seen.add(item.lower())
-
-    return result
 
 
-def find_column(df, candidates):
-    """Find a dataset column using common alternative names."""
-    normalized = {
-        re.sub(r"[^a-z0-9]", "", str(column).lower()): column
-        for column in df.columns
-    }
-
-    for candidate in candidates:
-        key = re.sub(r"[^a-z0-9]", "", candidate.lower())
-        if key in normalized:
-            return normalized[key]
-
-    return None
 
 
 # ---------------------------------------------------------
 # LOAD AND PREPARE DATA
 # ---------------------------------------------------------
 
-@st.cache_data(show_spinner="Loading the job dataset...")
-def load_jobs():
-    dataset = load_dataset(DATASET)
-
-    if hasattr(dataset, "keys"):
-        split_name = "train" if "train" in dataset else list(dataset.keys())[0]
-        source = dataset[split_name]
-    else:
-        source = dataset
-
-    df = source.to_pandas()
-
-    category_col = find_column(
-        df, ["category", "job_category", "role_category", "job_role"]
-    )
-    title_col = find_column(
-        df, ["job_title", "title", "position", "role", "job"]
-    )
-    description_col = find_column(
-        df, ["job_description", "description", "job_desc", "details"]
-    )
-    skills_col = find_column(
-        df, ["job_skill_set", "skills", "required_skills", "job_skills", "skill_set"]
-    )
-
-    missing = []
-    if category_col is None:
-        missing.append("category")
-    if title_col is None:
-        missing.append("job title")
-    if description_col is None:
-        missing.append("job description")
-
-    if missing:
-        raise ValueError(
-            "The downloaded dataset is missing required fields: "
-            + ", ".join(missing)
-            + ". Available columns: "
-            + ", ".join(map(str, df.columns))
-        )
-
-    result = pd.DataFrame()
-    result["category"] = df[category_col].map(clean)
-    result["job_title"] = df[title_col].map(clean)
-    result["job_description"] = df[description_col].map(clean)
-
-    if skills_col is not None:
-        result["job_skill_set"] = df[skills_col].map(clean)
-    else:
-        result["job_skill_set"] = ""
-
-    result = result.drop_duplicates(
-        subset=["category", "job_title", "job_description"]
-    )
-
-    result = result[
-        (result["category"] != "")
-        & (result["job_title"] != "")
-        & (result["job_description"] != "")
-    ].copy()
-
-    # Very rare categories are excluded to make held-out evaluation possible.
-    category_counts = result["category"].value_counts()
-    valid_categories = category_counts[category_counts >= 4].index
-    result = result[result["category"].isin(valid_categories)].reset_index(drop=True)
-
-    if result.empty:
-        raise ValueError(
-            "No usable records remain after cleaning. Check the dataset columns "
-            "and category counts."
-        )
-
-    result["combined_text"] = (
-        result["job_title"]
-        + " "
-        + result["job_description"]
-        + " "
-        + result["job_skill_set"]
-    ).str.strip()
-
-    return result
 
 
 # ---------------------------------------------------------
 # MACHINE-LEARNING CLASSIFIER
 # ---------------------------------------------------------
 
-@st.cache_resource(show_spinner="Training and evaluating the classifier...")
-def train_model(texts, labels):
-    texts = list(texts)
-    labels = list(labels)
-
-    number_of_classes = len(set(labels))
-
-    if number_of_classes < 2:
-        raise ValueError(
-            "At least two job categories are required to train a classifier."
-        )
-
-    counts = pd.Series(labels).value_counts()
-    if counts.min() < 4:
-        raise ValueError(
-            "Each category needs at least four records for this evaluation setup."
-        )
-
-    test_count = max(int(np.ceil(len(labels) * 0.25)), number_of_classes)
-    test_count = min(test_count, len(labels) - number_of_classes)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        texts,
-        labels,
-        test_size=test_count,
-        random_state=42,
-        stratify=labels,
-    )
-
-    evaluation_vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2),
-        max_features=20000,
-        min_df=1,
-        stop_words="english",
-        sublinear_tf=True,
-    )
-
-    X_train_tfidf = evaluation_vectorizer.fit_transform(X_train)
-    X_test_tfidf = evaluation_vectorizer.transform(X_test)
-
-    evaluation_model = LogisticRegression(
-        max_iter=1000,
-        class_weight="balanced",
-        random_state=42,
-    )
-    evaluation_model.fit(X_train_tfidf, y_train)
-
-    predictions = evaluation_model.predict(X_test_tfidf)
-
-    metrics = {
-        "accuracy": accuracy_score(y_test, predictions),
-        "macro_f1": f1_score(
-            y_test, predictions, average="macro", zero_division=0
-        ),
-        "report": classification_report(
-            y_test,
-            predictions,
-            output_dict=True,
-            zero_division=0,
-        ),
-        "test_size": len(y_test),
-    }
-
-    # Train the final predictor on all available records after evaluation.
-    final_vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2),
-        max_features=20000,
-        min_df=1,
-        stop_words="english",
-        sublinear_tf=True,
-    )
-    all_tfidf = final_vectorizer.fit_transform(texts)
-
-    final_model = LogisticRegression(
-        max_iter=1000,
-        class_weight="balanced",
-        random_state=42,
-    )
-    final_model.fit(all_tfidf, labels)
-
-    return final_vectorizer, final_model, metrics
 
 
 # ---------------------------------------------------------
 # SEMANTIC SEARCH
 # ---------------------------------------------------------
 
-@st.cache_resource(show_spinner="Loading the semantic search model...")
-def get_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL)
 
 
-@st.cache_data(show_spinner="Creating job-description embeddings...")
-def create_embeddings(texts):
-    model = get_embedding_model()
-    embeddings = model.encode(
-        list(texts),
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
-    return normalize(embeddings)
 
 
-def semantic_search(query, jobs, embeddings, top_k=5):
-    model = get_embedding_model()
-    query_embedding = model.encode(
-        [query],
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
-    query_embedding = normalize(query_embedding)
-
-    scores = cosine_similarity(query_embedding, embeddings)[0]
-    indices = np.argsort(scores)[::-1][:top_k]
-
-    results = jobs.iloc[indices][
-        ["job_title", "category", "job_description", "job_skill_set"]
-    ].copy()
-    results["similarity_score"] = scores[indices]
-    return results
 
 
 # ---------------------------------------------------------
 # GENERATIVE AI: GEMINI OR LOCAL OLLAMA
 # ---------------------------------------------------------
 
-def get_gemini_api_key():
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-
-    return os.getenv("GEMINI_API_KEY", "")
 
 
-def ai_answer(prompt):
-    """Use Gemini when configured; otherwise try a local Ollama model."""
-    api_key = get_gemini_api_key()
-    errors = []
-
-    if api_key:
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_MODEL}:generateContent"
-        )
-
-        try:
-            response = requests.post(
-                url,
-                params={"key": api_key},
-                json={
-                    "contents": [
-                        {"parts": [{"text": prompt}]}
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.2,
-                        "maxOutputTokens": 1200,
-                    },
-                },
-                timeout=60,
-            )
-
-            if response.ok:
-                data = response.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    answer = "\n".join(
-                        part.get("text", "")
-                        for part in parts
-                        if part.get("text")
-                    )
-                    if answer:
-                        return answer
-
-                errors.append("Gemini returned no text in its response.")
-            else:
-                errors.append(
-                    f"Gemini API returned HTTP {response.status_code}: "
-                    f"{response.text[:400]}"
-                )
-
-        except requests.RequestException as exc:
-            errors.append(f"Could not connect to Gemini: {exc}")
-
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=120,
-        )
-
-        if response.ok:
-            answer = response.json().get("response", "").strip()
-            if answer:
-                return answer
-
-        errors.append(
-            f"Ollama returned HTTP {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
-    except requests.RequestException:
-        errors.append(
-            "Local Ollama is unavailable. Start Ollama and ensure the "
-            f"'{OLLAMA_MODEL}' model is installed, or configure GEMINI_API_KEY."
-        )
-
-    return "AI request could not be completed.\n\n" + "\n\n".join(errors)
 
 
 # ---------------------------------------------------------
